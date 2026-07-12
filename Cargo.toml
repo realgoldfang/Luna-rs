@@ -1,0 +1,12 @@
+[package]
+name = "luna"
+version = "2.1.0"
+edition = "2021"
+
+[dependencies]
+libz-sys = "1"
+crc32fast = "1"
+
+[profile.release]
+lto = true
+opt-level = 2
