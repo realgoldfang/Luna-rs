@@ -52,7 +52,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "luna"
+name = "luna-nspire"
 version = "2.1.0"
 dependencies = [
  "crc32fast",

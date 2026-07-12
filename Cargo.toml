@@ -1,7 +1,15 @@
 [package]
-name = "luna"
+name = "luna-nspire"
 version = "2.1.0"
 edition = "2021"
+rust-version = "1.63"
+description = "Converts Lua/Python scripts and XML problems to TI-Nspire TNS documents"
+license = "MPL-1.1"
+repository = "https://github.com/ndless-nspire/Luna"
+homepage = "https://github.com/ndless-nspire/Luna"
+keywords = ["ti-nspire", "tns", "lua", "calculator"]
+categories = ["command-line-utilities", "encoding"]
+readme = "README.md"
 
 [dependencies]
 libz-sys = "1"
