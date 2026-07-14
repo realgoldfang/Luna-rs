@@ -25,7 +25,7 @@ jobs:
 
       - name: Trigger apt repo build
         env:
-          GH_TOKEN: ${{ secrets.APT_REPO_TOKEN }}
+          GH_TOKEN: ${{ secrets.APT_PAT }}
         run: |
           gh api repos/realgoldfang/realgoldfang.github.io/dispatches \
             --method POST \
