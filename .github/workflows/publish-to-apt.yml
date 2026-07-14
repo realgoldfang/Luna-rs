@@ -1,0 +1,35 @@
+# .github/workflows/publish-to-apt.yml
+# Add this to each source repo (mcp-sysd, howler, lupine, nspire-tools).
+# On release, triggers the apt repo build in realgoldfang.github.io.
+
+name: Publish to APT Repo
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  trigger-apt-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine package name
+        id: pkg
+        run: |
+          REPO="${{ github.repository }}"
+          PKG="${REPO##*/}"
+          # normalize nspire-cli/nspire-gui → nspire-tools
+          case "${PKG}" in
+            nspire-cli|nspire-gui) PKG="nspire-tools" ;;
+          esac
+          echo "name=${PKG}" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger apt repo build
+        env:
+          GH_TOKEN: ${{ secrets.APT_REPO_TOKEN }}
+        run: |
+          gh api repos/realgoldfang/realgoldfang.github.io/dispatches \
+            --method POST \
+            -f event_type="release-published" \
+            -f client_payload.package="${{ steps.pkg.outputs.name }}" \
+            -f client_payload.tag="${{ github.event.release.tag_name }}" \
+            -f client_payload.repo="${{ github.repository }}"
