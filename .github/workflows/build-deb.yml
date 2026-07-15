@@ -1,0 +1,347 @@
+# .github/workflows/build-deb.yml
+# Template for source repos to build their own .deb packages and publish to apt-repo.
+# Copy this file to your source repo's .github/workflows/ directory.
+#
+# Required secrets:
+#   - APT_PAT: PAT with push access to realgoldfang/apt-repo
+#   - APTLY_GPG_KEY: Base64-encoded GPG private key for signing (no passphrase)
+#
+# Required environment variables (set in repo Settings > Secrets and variables > Actions):
+#   - PACKAGE_NAME: The package name (e.g., backup-util)
+#   - APT_REPO: The apt-repo to push to (default: realgoldfang/apt-repo)
+#   - SITE_REPO: The site repo to trigger deploy (default: realgoldfang/realgoldfang.github.io)
+
+name: Build Deb Package
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-deb
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve inputs
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+
+      - name: Set package version
+        id: version
+        run: |
+          TAG="${{ steps.resolve.outputs.tag }}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # ──────────────────────────────────────────────────────────────
+      # Detect build type
+      # ──────────────────────────────────────────────────────────────
+      - name: Detect build type
+        id: detect
+        run: |
+          if [ -f "build-deb.sh" ]; then
+            echo "build_type=script" >> "$GITHUB_OUTPUT"
+            echo "==> build type: script"
+          elif [ -f "Cargo.toml" ]; then
+            echo "build_type=cargo" >> "$GITHUB_OUTPUT"
+            echo "==> build type: cargo"
+          elif [ -f "Makefile" ] && [ -f "*.c" ] 2>/dev/null; then
+            echo "build_type=make" >> "$GITHUB_OUTPUT"
+            echo "==> build type: make"
+          elif [ -f "package.json" ]; then
+            echo "build_type=electron" >> "$GITHUB_OUTPUT"
+            echo "==> build type: electron"
+          else
+            echo "error: unknown project type in $(pwd)"
+            exit 1
+          fi
+
+      # ──────────────────────────────────────────────────────────────
+      # Rust (cargo)
+      # ──────────────────────────────────────────────────────────────
+      - name: Set up Rust
+        if: steps.detect.outputs.build_type == 'cargo'
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install system deps (cargo)
+        if: steps.detect.outputs.build_type == 'cargo'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libasound2-dev pkg-config
+
+      - name: Detect binary targets
+        if: steps.detect.outputs.build_type == 'cargo'
+        id: bins
+        run: |
+          BINS=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+            | jq -r '.packages[].targets[] | select(.kind[] == "bin") | .name' \
+            | sort -u | tr '\n' ' ' | xargs)
+          if [ -z "${BINS}" ]; then
+            echo "error: no binary targets found"
+            cargo metadata --no-deps --format-version 1 2>/dev/null | jq .
+            exit 1
+          fi
+          echo "bins=${BINS}" >> "$GITHUB_OUTPUT"
+          echo "==> detected bins: ${BINS}"
+
+      - name: Build binaries (cargo)
+        if: steps.detect.outputs.build_type == 'cargo'
+        run: |
+          for binary in ${{ steps.bins.outputs.bins }}; do
+            echo "==> building ${binary}"
+            cargo build --release --bin "${binary}"
+          done
+
+      - name: Package .debs (cargo)
+        if: steps.detect.outputs.build_type == 'cargo'
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          ARCH="$(dpkg --print-architecture)"
+          PKG="${{ env.PACKAGE_NAME }}"
+          mkdir -p /tmp/debs
+
+          for binary in ${{ steps.bins.outputs.bins }}; do
+            echo "==> packaging ${binary}"
+            DEB_DIR="/tmp/debs/${binary}_${VER}_${ARCH}"
+            mkdir -p "${DEB_DIR}/DEBIAN" "${DEB_DIR}/usr/local/bin"
+            cp "target/release/${binary}" "${DEB_DIR}/usr/local/bin/${binary}"
+            chmod 755 "${DEB_DIR}/usr/local/bin/${binary}"
+
+            printf 'Package: %s\nVersion: %s\nArchitecture: %s\nMaintainer: goldfang <apt@realgoldfang.dev>\nDescription: %s\n' \
+              "${binary}" "${VER}" "${ARCH}" "${binary}" \
+              > "${DEB_DIR}/DEBIAN/control"
+
+            dpkg-deb --build "${DEB_DIR}" "/tmp/debs/${binary}_${VER}_${ARCH}.deb"
+          done
+
+      # ──────────────────────────────────────────────────────────────
+      # C (make)
+      # ──────────────────────────────────────────────────────────────
+      - name: Build binary (make)
+        if: steps.detect.outputs.build_type == 'make'
+        run: |
+          make clean 2>/dev/null || true
+          make -j"$(nproc)"
+
+      - name: Package .deb (make)
+        if: steps.detect.outputs.build_type == 'make'
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          ARCH="$(dpkg --print-architecture)"
+          PKG="${{ env.PACKAGE_NAME }}"
+          mkdir -p /tmp/debs
+
+          DEB_DIR="/tmp/debs/${PKG}_${VER}_${ARCH}"
+          mkdir -p "${DEB_DIR}/DEBIAN" "${DEB_DIR}/usr/local/bin"
+
+          BIN=$(find . -maxdepth 1 -type f -executable ! -name '*.o' ! -name '*.sh' | head -1)
+          if [ -z "${BIN}" ]; then BIN="${PKG}"; fi
+          cp "${BIN}" "${DEB_DIR}/usr/local/bin/"
+          chmod 755 "${DEB_DIR}/usr/local/bin/$(basename "${BIN}")"
+
+          printf 'Package: %s\nVersion: %s\nArchitecture: %s\nMaintainer: goldfang <apt@realgoldfang.dev>\nDescription: %s\n' \
+            "${PKG}" "${VER}" "${ARCH}" "${PKG}" \
+            > "${DEB_DIR}/DEBIAN/control"
+
+          dpkg-deb --build "${DEB_DIR}" "/tmp/debs/${PKG}_${VER}_${ARCH}.deb"
+
+      # ──────────────────────────────────────────────────────────────
+      # Python / build-deb.sh
+      # ──────────────────────────────────────────────────────────────
+      - name: Set up Python
+        if: steps.detect.outputs.build_type == 'script'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build .deb (build-deb.sh)
+        if: steps.detect.outputs.build_type == 'script'
+        run: |
+          chmod +x build-deb.sh
+          bash build-deb.sh
+          mkdir -p /tmp/debs
+          find . -name '*.deb' -exec cp {} /tmp/debs/ \;
+
+      # ──────────────────────────────────────────────────────────────
+      # Electron
+      # ──────────────────────────────────────────────────────────────
+      - name: Set up Node.js
+        if: steps.detect.outputs.build_type == 'electron'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build .deb (electron)
+        if: steps.detect.outputs.build_type == 'electron'
+        run: |
+          npm ci
+          npm run build:deb
+          mkdir -p /tmp/debs
+          find . -name '*.deb' -exec cp {} /tmp/debs/ \;
+
+      # ──────────────────────────────────────────────────────────────
+      # Verify we have debs to publish
+      # ──────────────────────────────────────────────────────────────
+      - name: Verify .deb output
+        run: |
+          echo "==> built debs:"
+          ls -la /tmp/debs/*.deb 2>/dev/null || { echo "error: no .deb files found"; exit 1; }
+
+      # ──────────────────────────────────────────────────────────────
+      # GPG + aptly
+      # ──────────────────────────────────────────────────────────────
+      - name: Checkout apt-repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APT_REPO || 'realgoldfang/apt-repo' }}
+          token: ${{ secrets.APT_PAT }}
+          path: apt-repo
+
+      - name: Import GPG key
+        env:
+          APTLY_GPG_KEY: ${{ secrets.APTLY_GPG_KEY }}
+        run: echo "${APTLY_GPG_KEY}" | base64 -d | gpg --batch --import
+
+      - name: Install aptly
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aptly
+
+      - name: Restore existing packages
+        working-directory: apt-repo
+        run: |
+          mkdir -p /tmp/existing-debs
+          for CODENAME in noble plucky; do
+            for ARCH in amd64 arm64; do
+              PKGS="public/dists/${CODENAME}/main/binary-${ARCH}/Packages.gz"
+              if [ -f "${PKGS}" ]; then
+                echo "==> restoring debs for ${CODENAME}/${ARCH}"
+                zcat "${PKGS}" | grep '^Filename:' | while read -r line; do
+                  path="${line#Filename: }"
+                  if [ -f "public/${path}" ]; then
+                    cp "public/${path}" "/tmp/existing-debs/$(basename "${path}")" 2>/dev/null || true
+                  fi
+                done
+              fi
+            done
+          done
+          echo "==> restored $(find /tmp/existing-debs -name '*.deb' 2>/dev/null | wc -l) existing debs"
+
+      - name: Publish with aptly
+        working-directory: apt-repo
+        run: |
+          export APTLY_ROOT="/tmp/aptly-root"
+          mkdir -p "${APTLY_ROOT}"
+
+          cat > /tmp/aptly.conf << EOF
+          {
+            "rootDir": "${APTLY_ROOT}",
+            "downloadConcurrency": 4,
+            "downloadPath": "${APTLY_ROOT}/downloads",
+            "databasePath": "${APTLY_ROOT}/db",
+            "publicPath": "",
+            "serveInAPoint": false
+          }
+          EOF
+          sed -i '/^$/d' /tmp/aptly.conf
+          sed -i 's/^ *//' /tmp/aptly.conf
+
+          KEY_ID="goldfang-apt-repo <apt@realgoldfang.dev>"
+
+          for CODENAME in noble plucky; do
+            REPO="goldfang-${CODENAME}"
+            aptly -config=/tmp/aptly.conf repo create \
+              -distribution="${CODENAME}" -component="main" \
+              -architectures="amd64,arm64" "${REPO}" 2>/dev/null || true
+          done
+
+          RUNNER_CODENAME="$(lsb_release -cs)"
+          SUPPORTED="${RUNNER_CODENAME}"
+          case "${RUNNER_CODENAME}" in noble|plucky) ;; *) SUPPORTED="noble" ;; esac
+
+          echo "==> adding existing debs to ${SUPPORTED}"
+          find /tmp/existing-debs -name '*.deb' 2>/dev/null | while read deb; do
+            aptly -config=/tmp/aptly.conf repo add "goldfang-${SUPPORTED}" "${deb}" || true
+          done
+
+          echo "==> adding new debs to ${SUPPORTED}"
+          find /tmp/debs -name '*.deb' 2>/dev/null | while read deb; do
+            echo "    + $(basename "${deb}")"
+            aptly -config=/tmp/aptly.conf repo add "goldfang-${SUPPORTED}" "${deb}" || true
+          done
+
+          for CODENAME in noble plucky; do
+            REPO="goldfang-${CODENAME}"
+            aptly -config=/tmp/aptly.conf repo show "${REPO}" 2>/dev/null || continue
+
+            if aptly -config=/tmp/aptly.conf publish list -raw 2>/dev/null | grep -q "^${CODENAME} "; then
+              echo "==> updating publish ${CODENAME}"
+              aptly -config=/tmp/aptly.conf publish update -batch \
+                -gpg-key="${KEY_ID}" -distribution="${CODENAME}" \
+                -architectures="amd64,arm64" "${CODENAME}" || true
+            else
+              echo "==> creating publish ${CODENAME}"
+              aptly -config=/tmp/aptly.conf publish repo -batch \
+                -gpg-key="${KEY_ID}" -distribution="${CODENAME}" \
+                -component="main" -architectures="amd64,arm64" \
+                "${REPO}" || true
+            fi
+          done
+
+          echo "==> aptly public tree:"
+          find "${APTLY_ROOT}/public/" -type f | head -30
+
+      - name: Copy published repo into apt-repo checkout
+        working-directory: apt-repo
+        run: |
+          APTLY_PUBLIC="/tmp/aptly-root/public"
+          if [ ! -d "${APTLY_PUBLIC}" ]; then
+            echo "error: aptly did not produce public/ output"
+            exit 1
+          fi
+          rm -rf public
+          cp -r "${APTLY_PUBLIC}" public
+          echo "==> copied aptly output to apt-repo/public/"
+          find public/ -type f | head -30
+
+      # ──────────────────────────────────────────────────────────────
+      # Push to apt-repo
+      # ──────────────────────────────────────────────────────────────
+      - name: Commit and push apt-repo
+        working-directory: apt-repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "no changes" && exit 0
+          git commit -m "apt: add ${{ env.PACKAGE_NAME }} ${{ steps.resolve.outputs.tag }}"
+          git push
+
+      # ──────────────────────────────────────────────────────────────
+      # Trigger site deploy
+      # ──────────────────────────────────────────────────────────────
+      - name: Trigger site deploy
+        run: |
+          gh workflow run deploy-site.yml \
+            --repo ${{ env.SITE_REPO || 'realgoldfang/realgoldfang.github.io' }}
